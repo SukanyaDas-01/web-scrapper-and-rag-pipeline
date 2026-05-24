@@ -1,0 +1,7 @@
+trafilatura
+beautifulsoup4
+requests
+spacy
+sentence-transformers
+faiss-cpu
+numpy
