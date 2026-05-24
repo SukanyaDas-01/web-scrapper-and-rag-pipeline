@@ -3,11 +3,14 @@ import textwrap
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
+from transformers import T5ForConditionalGeneration, T5Tokenizer
 
-# ── Module-level singletons (initialised once by setup_rag) ──────────────────
-_embedder = None
-_index    = None
-_chunks   = []
+# ── Module-level singletons ───────────────────────────────────────────────────
+_embedder  = None
+_index     = None
+_chunks    = []
+_generator = None
+_tokenizer = None
 
 OVERVIEW_TRIGGERS = [
     "what is", "what's", "what does", "tell me about",
@@ -18,30 +21,46 @@ OVERVIEW_TRIGGERS = [
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-def setup_rag(cleaned_text, model_name="all-MiniLM-L6-v2",
-              chunk_size=4, overlap=2):
+def setup_rag(cleaned_text, embed_model="all-MiniLM-L6-v2",
+              gen_model="google/flan-t5-base", chunk_size=4, overlap=2):
     """
     Call once after scraping.
-    Chunks cleaned_text → embeds → builds FAISS index.
-    Returns (chunks, embedder, index).
+    Loads:
+      - SentenceTransformer  → embeddings
+      - flan-t5-base         → answer generation
+      - FAISS index          → vector search
     """
-    global _embedder, _index, _chunks
+    global _embedder, _index, _chunks, _generator, _tokenizer
 
-    _embedder = SentenceTransformer(model_name)
+    # 1. Load embedding model
+    print("⏳ Loading embedding model...")
+    _embedder = SentenceTransformer(embed_model)
+
+    # 2. Load flan-t5 generator
+    print("⏳ Loading flan-t5-base generator (~300MB, one-time download)...")
+    _tokenizer = T5Tokenizer.from_pretrained(gen_model)
+    _generator = T5ForConditionalGeneration.from_pretrained(gen_model)
+    print("✅ Generator loaded")
+
+    # 3. Chunk text
     _chunks, _ = _chunk_text(cleaned_text, chunk_size, overlap)
 
+    # 4. Embed chunks
     print(f"⏳ Encoding {len(_chunks)} chunks...")
     embeddings = _embedder.encode(
-        _chunks, batch_size=32, show_progress_bar=True,
-        convert_to_numpy=True, normalize_embeddings=True,
+        _chunks,
+        batch_size=32,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
     )
 
+    # 5. Build FAISS index
     _index = faiss.IndexFlatIP(embeddings.shape[1])
     _index.add(embeddings)
 
-    print(f"✅ FAISS index ready — {_index.ntotal} vectors, "
-          f"dim={embeddings.shape[1]}")
-    return _chunks, _embedder, _index
+    print(f"✅ FAISS index ready — {_index.ntotal} vectors, dim={embeddings.shape[1]}")
+    print("✅ RAG pipeline ready\n")
 
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
@@ -68,103 +87,119 @@ def _chunk_text(text, chunk_size=4, overlap=2, min_chunk_chars=120):
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 
-# src/rag.py
-
-def retrieve(query, top_k=5, min_score=0.10):  # lowered from 0.15 → 0.10
+def retrieve(query, top_k=5, min_score=0.10):
     q_vec = _embedder.encode(
-        [query], convert_to_numpy=True, normalize_embeddings=True,
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
     )
     scores, indices = _index.search(q_vec, top_k)
-    return [
-        {"chunk_id": int(idx), "score": round(float(sc), 4),
-         "text": _chunks[idx]}
+
+    results = [
+        {
+            "chunk_id": int(idx),
+            "score":    round(float(sc), 4),
+            "text":     _chunks[idx],
+        }
         for sc, idx in zip(scores[0], indices[0])
         if sc >= min_score
     ]
+    return results
 
 
-# ── Answer generation ─────────────────────────────────────────────────────────
+# ── Prompt Builder ────────────────────────────────────────────────────────────
 
-def _is_overview_query(q):
-    q = q.lower().strip()
-    return any(q.startswith(t) or t in q for t in OVERVIEW_TRIGGERS)
+def _build_prompt(question, context_chunks):
+    """
+    Assembles retrieved chunks into a clean prompt for flan-t5.
+    flan-t5 works best with the format:
+    'answer the question based on the context: ... question: ...'
+    """
+    context = " ".join([chunk["text"] for chunk in context_chunks])
 
+    # Trim context to 450 words — flan-t5-base has a 512 token input limit
+    context_words = context.split()
+    if len(context_words) > 450:
+        context = " ".join(context_words[:450]) + "..."
 
-def _build_overview_answer(context_chunks, max_sentences=3):
-    all_sentences = []
-    for item in context_chunks:
-        for s in re.split(r"(?<=[.!?])\s+", item["text"]):
-            s = s.strip()
-            if 40 <= len(s) <= 300:
-                all_sentences.append((s, item["score"]))
-
-    seen, unique = set(), []
-    for s, sc in all_sentences:
-        key = s.lower()[:80]
-        if key not in seen:
-            seen.add(key)
-            unique.append((s, sc))
-
-    top_set = {s for s, _ in sorted(unique, key=lambda x: -x[1])[:max_sentences]}
-    ordered = [s for s, _ in unique if s in top_set]
-    return " ".join(ordered) if ordered else context_chunks[0]["text"]
-
-
-def _extract_specific_answer(query, context_chunks):
-    q_vec = _embedder.encode(
-        [query], convert_to_numpy=True, normalize_embeddings=True,
+    prompt = (
+        f"Answer the question based only on the context below. "
+        f"If the answer is not in the context, say 'I don't know'.\n\n"
+        f"Context: {context}\n\n"
+        f"Question: {question}\n\n"
+        f"Answer:"
     )
-    best_score, best_sentence = -1.0, ""
-
-    for item in context_chunks:
-        sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", item["text"])
-                 if len(s.strip()) > 25]
-        if not sents:
-            continue
-        s_vecs = _embedder.encode(
-            sents, convert_to_numpy=True, normalize_embeddings=True,
-        )
-        for i, sim in enumerate((s_vecs @ q_vec.T).flatten()):
-            combined = 0.7 * sim + 0.3 * item["score"]
-            if combined > best_score:
-                best_score, best_sentence = combined, sents[i]
-
-    return best_sentence or context_chunks[0]["text"]
+    return prompt
 
 
-# ── Public query interface ────────────────────────────────────────────────────
+# ── Generative Answer ─────────────────────────────────────────────────────────
+
+def _generate_answer(prompt, max_new_tokens=150):
+    """
+    Passes the prompt through flan-t5-base and returns generated answer.
+    """
+    inputs = _tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    )
+
+    outputs = _generator.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        num_beams=4,             # beam search for better quality
+        early_stopping=True,
+        no_repeat_ngram_size=3,  # avoid repetition
+        temperature=0.7,
+    )
+
+    answer = _tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return answer.strip()
+
+
+# ── Public Query Interface ────────────────────────────────────────────────────
 
 def rag_query(question, top_k=5, show_sources=False):
-    print(f"\n{'='*60}\n❓  {question}\n{'='*60}")
+    print(f"\n{'='*60}")
+    print(f"❓  {question}")
+    print(f"{'='*60}")
 
+    # 1. Retrieve relevant chunks
     results = retrieve(question, top_k=top_k)
 
-    # ── Fallback: if no results pass threshold, take top-3 anyway ──
+    # 2. Fallback if nothing passes threshold
     if not results:
         q_vec = _embedder.encode(
-            [question], convert_to_numpy=True, normalize_embeddings=True,
+            [question],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
         )
         scores, indices = _index.search(q_vec, min(3, len(_chunks)))
         results = [
-            {"chunk_id": int(idx), "score": round(float(sc), 4),
-             "text": _chunks[idx]}
+            {
+                "chunk_id": int(idx),
+                "score":    round(float(sc), 4),
+                "text":     _chunks[idx],
+            }
             for sc, idx in zip(scores[0], indices[0])
         ]
-        print("ℹ️  Low confidence — showing best available context.\n")
+        print("ℹ️  Low confidence — using best available context.\n")
 
-    if _is_overview_query(question):
-        answer = _build_overview_answer(results, max_sentences=3)
-        mode   = "overview"
-    else:
-        answer = _extract_specific_answer(question, results)
-        mode   = "specific"
+    # 3. Build prompt from retrieved chunks
+    prompt = _build_prompt(question, results)
 
-    print(f"\n💡 Answer ({mode}):\n   "
-          f"{textwrap.fill(answer, 80, subsequent_indent='   ')}")
+    # 4. Generate answer with flan-t5
+    answer = _generate_answer(prompt)
+
+    print(f"\n💡 Answer:\n   {textwrap.fill(answer, 80, subsequent_indent='   ')}")
 
     if show_sources:
         print(f"\n📄 Sources ({len(results)} chunks):")
         for r in results:
             print(f"\n  [chunk {r['chunk_id']}]  score={r['score']}")
-            print(textwrap.fill(r["text"], 80,
-                                initial_indent="  ", subsequent_indent="  "))
+            print(textwrap.fill(
+                r["text"], 80,
+                initial_indent="  ",
+                subsequent_indent="  ",
+            ))

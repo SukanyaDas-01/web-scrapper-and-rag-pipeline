@@ -5,3 +5,5 @@ spacy
 sentence-transformers
 faiss-cpu
 numpy
+transformers
+torch
