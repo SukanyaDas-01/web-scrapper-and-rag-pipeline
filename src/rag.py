@@ -68,7 +68,9 @@ def _chunk_text(text, chunk_size=4, overlap=2, min_chunk_chars=120):
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 
-def retrieve(query, top_k=5, min_score=0.15):
+# src/rag.py
+
+def retrieve(query, top_k=5, min_score=0.10):  # lowered from 0.15 → 0.10
     q_vec = _embedder.encode(
         [query], convert_to_numpy=True, normalize_embeddings=True,
     )
@@ -136,9 +138,19 @@ def rag_query(question, top_k=5, show_sources=False):
     print(f"\n{'='*60}\n❓  {question}\n{'='*60}")
 
     results = retrieve(question, top_k=top_k)
+
+    # ── Fallback: if no results pass threshold, take top-3 anyway ──
     if not results:
-        print("⚠️  No relevant content found. Try rephrasing.")
-        return
+        q_vec = _embedder.encode(
+            [question], convert_to_numpy=True, normalize_embeddings=True,
+        )
+        scores, indices = _index.search(q_vec, min(3, len(_chunks)))
+        results = [
+            {"chunk_id": int(idx), "score": round(float(sc), 4),
+             "text": _chunks[idx]}
+            for sc, idx in zip(scores[0], indices[0])
+        ]
+        print("ℹ️  Low confidence — showing best available context.\n")
 
     if _is_overview_query(question):
         answer = _build_overview_answer(results, max_sentences=3)
