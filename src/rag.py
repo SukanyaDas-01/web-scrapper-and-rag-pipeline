@@ -4,6 +4,10 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 from transformers import T5ForConditionalGeneration, T5Tokenizer
+import logging
+import os
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 # ── Module-level singletons ───────────────────────────────────────────────────
 _embedder  = None
@@ -111,32 +115,54 @@ def retrieve(query, top_k=5, min_score=0.10):
 
 def _build_prompt(question, context_chunks):
     """
-    Assembles retrieved chunks into a clean prompt for flan-t5.
-    flan-t5 works best with the format:
-    'answer the question based on the context: ... question: ...'
+    flan-t5 works best with explicit instruction-style prompts.
+    Different prompt templates for overview vs specific questions.
     """
     context = " ".join([chunk["text"] for chunk in context_chunks])
 
-    # Trim context to 450 words — flan-t5-base has a 512 token input limit
+    # Trim to 450 words — flan-t5-base has 512 token input limit
     context_words = context.split()
     if len(context_words) > 450:
         context = " ".join(context_words[:450]) + "..."
 
-    prompt = (
-        f"Answer the question based only on the context below. "
-        f"If the answer is not in the context, say 'I don't know'.\n\n"
-        f"Context: {context}\n\n"
-        f"Question: {question}\n\n"
-        f"Answer:"
-    )
+    q_lower = question.lower().strip()
+
+    # Overview questions → ask for a summary-style answer
+    if any(t in q_lower for t in ["about", "what is", "overview",
+                                   "describe", "tell me", "explain"]):
+        prompt = (
+            f"Read the following context and write a detailed summary "
+            f"of what it is about.\n\n"
+            f"Context: {context}\n\n"
+            f"Summary:"
+        )
+
+    # How/Why questions → ask for explanation
+    elif any(t in q_lower for t in ["how", "why", "explain"]):
+        prompt = (
+            f"Read the context and answer the question in detail.\n\n"
+            f"Context: {context}\n\n"
+            f"Question: {question}\n\n"
+            f"Detailed answer:"
+        )
+
+    # Default → direct QA
+    else:
+        prompt = (
+            f"Context: {context}\n\n"
+            f"Based on the context above, answer this question: "
+            f"{question}"
+        )
+
     return prompt
 
 
 # ── Generative Answer ─────────────────────────────────────────────────────────
 
-def _generate_answer(prompt, max_new_tokens=150):
+def _generate_answer(prompt, max_new_tokens=200):
     """
-    Passes the prompt through flan-t5-base and returns generated answer.
+    flan-t5-base generation — temperature removed,
+    using beam search with repetition penalty instead.
     """
     inputs = _tokenizer(
         prompt,
@@ -148,10 +174,11 @@ def _generate_answer(prompt, max_new_tokens=150):
     outputs = _generator.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        num_beams=4,             # beam search for better quality
+        num_beams=4,
         early_stopping=True,
-        no_repeat_ngram_size=3,  # avoid repetition
-        temperature=0.7,
+        no_repeat_ngram_size=3,
+        repetition_penalty=2.5,   # strongly discourages repetition
+        length_penalty=1.5,       # encourages longer, fuller answers
     )
 
     answer = _tokenizer.decode(outputs[0], skip_special_tokens=True)
