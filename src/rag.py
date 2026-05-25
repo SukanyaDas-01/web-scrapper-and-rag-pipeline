@@ -1,11 +1,12 @@
 import re
+import os
+import logging
 import textwrap
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 from transformers import T5ForConditionalGeneration, T5Tokenizer
-import logging
-import os
+
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
@@ -17,52 +18,38 @@ _generator = None
 _tokenizer = None
 
 OVERVIEW_TRIGGERS = [
-    "what is", "what's", "what does", "tell me about",
-    "describe", "overview", "summary", "about",
-    "explain", "main topic", "main idea",
+    "what is", "what's", "what does", "tell me about", "tell about",
+    "describe", "overview", "summary", "about", "explain",
+    "main topic", "main idea", "tell me",
 ]
+
+HOW_WHY_TRIGGERS = ["how", "why", "when", "where", "who"]
 
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 def setup_rag(cleaned_text, embed_model="all-MiniLM-L6-v2",
               gen_model="google/flan-t5-base", chunk_size=4, overlap=2):
-    """
-    Call once after scraping.
-    Loads:
-      - SentenceTransformer  → embeddings
-      - flan-t5-base         → answer generation
-      - FAISS index          → vector search
-    """
     global _embedder, _index, _chunks, _generator, _tokenizer
 
-    # 1. Load embedding model
     print("⏳ Loading embedding model...")
     _embedder = SentenceTransformer(embed_model)
 
-    # 2. Load flan-t5 generator
     print("⏳ Loading flan-t5-base generator (~300MB, one-time download)...")
     _tokenizer = T5Tokenizer.from_pretrained(gen_model)
     _generator = T5ForConditionalGeneration.from_pretrained(gen_model)
     print("✅ Generator loaded")
 
-    # 3. Chunk text
     _chunks, _ = _chunk_text(cleaned_text, chunk_size, overlap)
 
-    # 4. Embed chunks
     print(f"⏳ Encoding {len(_chunks)} chunks...")
     embeddings = _embedder.encode(
-        _chunks,
-        batch_size=32,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
+        _chunks, batch_size=32, show_progress_bar=True,
+        convert_to_numpy=True, normalize_embeddings=True,
     )
 
-    # 5. Build FAISS index
     _index = faiss.IndexFlatIP(embeddings.shape[1])
     _index.add(embeddings)
-
     print(f"✅ FAISS index ready — {_index.ntotal} vectors, dim={embeddings.shape[1]}")
     print("✅ RAG pipeline ready\n")
 
@@ -93,97 +80,104 @@ def _chunk_text(text, chunk_size=4, overlap=2, min_chunk_chars=120):
 
 def retrieve(query, top_k=5, min_score=0.10):
     q_vec = _embedder.encode(
-        [query],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
+        [query], convert_to_numpy=True, normalize_embeddings=True,
     )
     scores, indices = _index.search(q_vec, top_k)
-
-    results = [
-        {
-            "chunk_id": int(idx),
-            "score":    round(float(sc), 4),
-            "text":     _chunks[idx],
-        }
+    return [
+        {"chunk_id": int(idx), "score": round(float(sc), 4),
+         "text": _chunks[idx]}
         for sc, idx in zip(scores[0], indices[0])
         if sc >= min_score
     ]
-    return results
 
 
-# ── Prompt Builder ────────────────────────────────────────────────────────────
+# ── Sentence scorer ───────────────────────────────────────────────────────────
 
-def _build_prompt(question, context_chunks):
+def _score_sentences(query, context_chunks, top_n=5):
     """
-    Use only top 2 chunks — flan-t5-base has a hard 512 token limit.
-    Exceeding it causes the model to ignore context and hallucinate.
+    Re-ranks every sentence from retrieved chunks by cosine
+    similarity to the query. Returns top_n unique sentences
+    ordered by relevance score — used to build both the
+    composed answer and the flan-t5 prompt.
     """
-    # Sort by score, take only top 2
-    top_chunks = sorted(context_chunks, key=lambda x: -x["score"])[:2]
+    q_vec = _embedder.encode(
+        [query], convert_to_numpy=True, normalize_embeddings=True,
+    )
 
-    context = " ".join([chunk["text"] for chunk in top_chunks])
+    scored = []
+    seen   = set()
 
-    # Hard trim to 350 words to stay safely within 512 tokens
-    context_words = context.split()
-    if len(context_words) > 350:
-        context = " ".join(context_words[:350])
+    for item in context_chunks:
+        sents = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?])\s+", item["text"])
+            if len(s.strip()) > 30
+        ]
+        if not sents:
+            continue
+
+        s_vecs = _embedder.encode(
+            sents, convert_to_numpy=True, normalize_embeddings=True,
+        )
+        sims = (s_vecs @ q_vec.T).flatten()
+
+        for i, sim in enumerate(sims):
+            combined = float(0.7 * sim + 0.3 * item["score"])
+            key      = sents[i].lower()[:80]
+            if key not in seen:
+                seen.add(key)
+                scored.append((combined, sents[i]))
+
+    scored.sort(reverse=True)
+    return [s for _, s in scored[:top_n]]
+
+
+# ── Prompt builder ────────────────────────────────────────────────────────────
+
+def _build_prompt(question, top_sentences):
+    """
+    Builds a tight prompt from the top scored sentences.
+    Strictly capped at 300 words so flan-t5 never overflows.
+    """
+    context = " ".join(top_sentences)
+    words   = context.split()
+    if len(words) > 300:
+        context = " ".join(words[:300])
 
     q_lower = question.lower().strip()
 
-    # Overview / summary questions
-    if any(t in q_lower for t in ["about", "what is", "overview",
-                                   "describe", "tell me about",
-                                   "explain", "main topic"]):
-        prompt = (
-            f"Read the context carefully and write a clear summary.\n"
+    if any(t in q_lower for t in OVERVIEW_TRIGGERS):
+        return (
+            f"Write a detailed paragraph summarizing the following context.\n"
             f"Context: {context}\n"
-            f"Summary:"
+            f"Paragraph:"
         )
-
-    # How / Why questions
-    elif any(t in q_lower for t in ["how", "why"]):
-        prompt = (
-            f"Read the context and answer the question.\n"
+    elif any(t in q_lower for t in HOW_WHY_TRIGGERS):
+        return (
+            f"Answer the question in detail using the context.\n"
             f"Context: {context}\n"
             f"Question: {question}\n"
             f"Answer:"
         )
-
-    # Tell me about / describe specific topic
-    elif "tell" in q_lower or "describe" in q_lower:
-        prompt = (
-            f"Based only on the context below, describe the topic "
-            f"asked in the question.\n"
-            f"Context: {context}\n"
-            f"Question: {question}\n"
-            f"Answer:"
-        )
-
-    # Default direct QA
     else:
-        prompt = (
+        return (
             f"Context: {context}\n"
             f"Question: {question}\n"
             f"Answer:"
         )
 
-    return prompt
 
+# ── flan-t5 generation ────────────────────────────────────────────────────────
 
-# ── Generative Answer ─────────────────────────────────────────────────────────
-
-def _generate_answer(prompt, max_new_tokens=200):
+def _generate(prompt):
     inputs = _tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
         max_length=512,
     )
-
-    # Check how many tokens the prompt actually consumed
-    input_len = inputs["input_ids"].shape[1]
-    # Leave enough room for the answer
-    allowed_new_tokens = min(max_new_tokens, max(50, 512 - input_len))
+    input_len         = inputs["input_ids"].shape[1]
+    allowed_new_tokens = max(80, 512 - input_len)
 
     outputs = _generator.generate(
         **inputs,
@@ -192,24 +186,33 @@ def _generate_answer(prompt, max_new_tokens=200):
         early_stopping=True,
         no_repeat_ngram_size=3,
         repetition_penalty=2.5,
-        length_penalty=1.5,
+        length_penalty=2.0,
     )
-
-    answer = _tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer.strip()
+    return _tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
 
-# ── Public Query Interface ────────────────────────────────────────────────────
+# ── Composed answer (fallback when flan-t5 gives short/bad answer) ────────────
+
+def _compose_answer(top_sentences, min_sentences=3):
+    """
+    Joins the top scored sentences into a clean paragraph.
+    Used as fallback when flan-t5 output is too short.
+    """
+    # Re-order by original chunk order for readability
+    answer = " ".join(top_sentences[:min_sentences])
+    return answer
+
+
+# ── Public query interface ────────────────────────────────────────────────────
 
 def rag_query(question, top_k=5, show_sources=False):
     print(f"\n{'='*60}")
     print(f"❓  {question}")
     print(f"{'='*60}")
 
-    # Retrieve top-k for display
+    # 1. Retrieve
     results = retrieve(question, top_k=top_k)
 
-    # Fallback if nothing passes threshold
     if not results:
         q_vec = _embedder.encode(
             [question], convert_to_numpy=True, normalize_embeddings=True,
@@ -222,15 +225,39 @@ def rag_query(question, top_k=5, show_sources=False):
         ]
         print("ℹ️  Low confidence — using best available context.\n")
 
-    # ── Pass only top 2 to prompt to stay within token limit ──
-    prompt_chunks = sorted(results, key=lambda x: -x["score"])[:2]
-    prompt  = _build_prompt(question, prompt_chunks)
-    answer  = _generate_answer(prompt)
+    # 2. Score sentences across all retrieved chunks
+    top_sentences = _score_sentences(question, results, top_n=5)
 
-    print(f"\n💡 Answer:\n   {textwrap.fill(answer, 80, subsequent_indent='   ')}")
+    # 3. Build tight prompt from top sentences
+    prompt = _build_prompt(question, top_sentences)
+
+    # 4. Generate with flan-t5
+    generated = _generate(prompt)
+
+    # 5. Quality check — if flan-t5 gives a very short or
+    #    evasive answer, fall back to composed sentence answer
+    fallback_phrases = ["i don't know", "i do not know", "unknown", "n/a"]
+    use_fallback = (
+        len(generated.split()) < 10
+        or any(p in generated.lower() for p in fallback_phrases)
+    )
+
+    if use_fallback:
+        answer = _compose_answer(top_sentences, min_sentences=3)
+        mode   = "composed"
+    else:
+        answer = generated
+        mode   = "generated"
+
+    print(f"\n💡 Answer ({mode}):\n   "
+          f"{textwrap.fill(answer, 80, subsequent_indent='   ')}")
 
     if show_sources:
-        print(f"\n📄 Sources ({len(results)} chunks):")
+        print(f"\n📄 Top sentences used:")
+        for i, s in enumerate(top_sentences, 1):
+            print(f"\n  [{i}] {textwrap.fill(s, 78, initial_indent='      ', subsequent_indent='      ')}")
+
+        print(f"\n📄 Retrieved chunks ({len(results)}):")
         for r in results:
             print(f"\n  [chunk {r['chunk_id']}]  score={r['score']}")
             print(textwrap.fill(r["text"], 80,
