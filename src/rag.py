@@ -5,6 +5,14 @@ import textwrap
 import numpy as np
 import faiss
 
+# ── Redirect ALL HuggingFace downloads to D: drive ───────────────────────────
+os.environ["HF_HOME"]              = r"D:\hf_cache"
+os.environ["TRANSFORMERS_CACHE"]   = r"D:\hf_cache\transformers"
+os.environ["HF_DATASETS_CACHE"]    = r"D:\hf_cache\datasets"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 from sentence_transformers import SentenceTransformer
 from transformers import (
     T5ForConditionalGeneration,
@@ -12,17 +20,13 @@ from transformers import (
     pipeline,
 )
 
-# ── Suppress noisy transformer warnings ──────────────────────────────────────
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-logging.getLogger("transformers").setLevel(logging.ERROR)
-
 # ── Module-level singletons ───────────────────────────────────────────────────
 _embedder    = None
 _index       = None
 _chunks      = []
 _generator   = None
 _tokenizer   = None
-_qa_pipeline = None
+_qa_pipeline = None          # ← RoBERTa QA pipeline
 
 # ── Question type triggers ────────────────────────────────────────────────────
 FACTUAL_TRIGGERS  = ["who", "when", "where", "which", "how many", "how much"]
@@ -35,7 +39,7 @@ HOW_WHY_TRIGGERS  = ["how", "why"]
 
 # ── Confidence thresholds ─────────────────────────────────────────────────────
 HIGH_CONFIDENCE = 0.60
-LOW_CONFIDENCE  = 0.55   # below this → reject as off-topic
+LOW_CONFIDENCE  = 0.55
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -45,17 +49,18 @@ LOW_CONFIDENCE  = 0.55   # below this → reject as off-topic
 def setup_rag(
     cleaned_text,
     embed_model = "multi-qa-MiniLM-L6-cos-v1",
-    gen_model   = "google/flan-t5-large",
+    gen_model   = "google/flan-t5-base",
     qa_model    = "deepset/roberta-base-squad2",
     chunk_size  = 4,
     overlap     = 2,
 ):
     """
     Initialises the full RAG pipeline:
-      - multi-qa-MiniLM-L6-cos-v1  → embeddings (QA-tuned)
-      - flan-t5-large               → overview / summary generation
-      - roberta-base-squad2         → factual extractive QA
+      - multi-qa-MiniLM-L6-cos-v1  → embeddings (QA-tuned, ~80MB)
+      - google/flan-t5-base         → overview / summary generation (~250MB)
+      - deepset/roberta-base-squad2 → factual extractive QA (~500MB)
       - FAISS IndexFlatIP           → cosine similarity search
+    All models cached to D:\\hf_cache
     """
     global _embedder, _index, _chunks, _generator, _tokenizer, _qa_pipeline
 
@@ -64,14 +69,14 @@ def setup_rag(
     _embedder = SentenceTransformer(embed_model)
     print("✅ Embedding model loaded")
 
-    # 2 ── flan-t5-large for overview / summary answers
-    print("⏳ Loading flan-t5-large (~780MB, one-time download)...")
+    # 2 ── flan-t5-base for overview / summary answers
+    print("⏳ Loading flan-t5-base (~250MB)...")
     _tokenizer = T5Tokenizer.from_pretrained(gen_model)
     _generator = T5ForConditionalGeneration.from_pretrained(gen_model)
-    print("✅ flan-t5-large loaded")
+    print("✅ flan-t5-base loaded")
 
     # 3 ── RoBERTa for factual extractive QA
-    print("⏳ Loading roberta-base-squad2 (~500MB, one-time download)...")
+    print("⏳ Loading roberta-base-squad2 (~500MB)...")
     _qa_pipeline = pipeline(
         "question-answering",
         model=qa_model,
@@ -107,7 +112,7 @@ def setup_rag(
 def _chunk_text(text, chunk_size=4, overlap=2, min_chunk_chars=120):
     """
     Splits cleaned text into overlapping sentence-window chunks.
-    Bullet markers are stripped first to avoid fragment answers.
+    Bullet markers stripped first to avoid fragment answers.
     """
     text = re.sub(r"(?m)^\s*[-•*]\s*", "", text)
 
@@ -116,7 +121,6 @@ def _chunk_text(text, chunk_size=4, overlap=2, min_chunk_chars=120):
         for s in re.split(r"(?<=[.!?])\s+", text)
         if len(s.strip()) > 30
     ]
-
     if not sentences:
         raise ValueError("No usable sentences found in cleaned_text.")
 
@@ -160,8 +164,7 @@ def retrieve(query, top_k=5, min_score=0.10):
 
 def _score_sentences(query, context_chunks, top_n=5):
     """
-    Re-ranks every individual sentence inside retrieved chunks
-    using a blended score:
+    Re-ranks every sentence inside retrieved chunks using:
         0.7 × sentence_cosine_sim + 0.3 × parent_chunk_score
     Returns top_n unique sentences ordered by relevance.
     """
@@ -202,8 +205,8 @@ def _score_sentences(query, context_chunks, top_n=5):
 
 def _format_answer(question, top_sentences):
     """
-    Removes citation noise, archive lines, and URL fragments
-    from the top sentences before forming the final answer.
+    Strips citation noise, archive lines, URL fragments,
+    and bibliography entries before forming the final answer.
     """
     NOISE_PATTERNS = [
         r"^Archived from",
@@ -221,7 +224,7 @@ def _format_answer(question, top_sentences):
         r"first India office",
         r"invest Rs \d+",
         r"crore to set up",
-        r"^\w+,\s+\w+\s+\(\d{4}\)\.",    # bibliography entries
+        r"^\w+,\s+\w+\s+\(\d{4}\)\.",
         r"Archived on \d+",
     ]
 
@@ -242,9 +245,9 @@ def _format_answer(question, top_sentences):
 
 def _answer_with_roberta(question, context_chunks):
     """
-    Extractive QA using RoBERTa — best for factual questions
-    (who, when, where, which, how many).
-    Tries each chunk independently and returns the highest-confidence answer.
+    Extractive QA using RoBERTa.
+    Tries every retrieved chunk and returns the highest-confidence span.
+    Best for: who / when / where / which / how many questions.
     """
     best_score, best_answer = -1.0, ""
 
@@ -266,7 +269,7 @@ def _answer_with_roberta(question, context_chunks):
 
 def _build_prompt(question, top_sentences):
     """
-    Assembles a tight flan-t5 prompt from top-scored sentences.
+    Assembles a flan-t5 prompt from top-scored sentences.
     Hard-capped at 300 words to stay within the 512-token limit.
     """
     context = " ".join(top_sentences)
@@ -299,8 +302,8 @@ def _build_prompt(question, top_sentences):
 
 def _generate_with_flant5(prompt):
     """
-    Generates a natural language answer using flan-t5-large.
-    Dynamically adjusts max_new_tokens based on remaining token budget.
+    Generates a natural language answer using flan-t5-base.
+    Dynamically caps max_new_tokens based on remaining token budget.
     """
     inputs    = _tokenizer(
         prompt, return_tensors="pt",
@@ -330,7 +333,7 @@ def rag_query(question, top_k=5, show_sources=False):
     print(f"❓  {question}")
     print(f"{'='*60}")
 
-    # ── 1. Retrieve top-k chunks ───────────────────────────────────────────
+    # ── 1. Retrieve ────────────────────────────────────────────────────────
     results = retrieve(question, top_k=top_k)
 
     if not results:
@@ -339,7 +342,7 @@ def rag_query(question, top_k=5, show_sources=False):
 
     best_score = results[0]["score"]
 
-    # ── 2. Hard out-of-scope gate ──────────────────────────────────────────
+    # ── 2. Out-of-scope gate ───────────────────────────────────────────────
     if best_score < LOW_CONFIDENCE:
         print(
             f"\n🤷 This question doesn't seem related to the scraped page.\n"
@@ -351,33 +354,31 @@ def rag_query(question, top_k=5, show_sources=False):
 
     q_lower = question.lower().strip()
 
-    # ── 3. Route to correct answer strategy ───────────────────────────────
+    # ── 3. Route to answer strategy ───────────────────────────────────────
     if any(q_lower.startswith(t) or t in q_lower for t in FACTUAL_TRIGGERS):
-        # ── Path A: Factual → RoBERTa extractive QA ───────────────────────
+        # Path A — Factual → RoBERTa extractive QA
         answer, qa_score = _answer_with_roberta(question, results)
         mode = "factual · RoBERTa"
 
-        # Fallback if RoBERTa returns too short or low-confidence answer
         if not answer or len(answer.split()) < 3 or qa_score < 0.10:
             top_sentences = _score_sentences(question, results, top_n=3)
-            answer = _format_answer(question, top_sentences)
-            mode   = "factual · composed fallback"
+            answer        = _format_answer(question, top_sentences)
+            mode          = "factual · composed fallback"
 
     elif any(t in q_lower for t in OVERVIEW_TRIGGERS + HOW_WHY_TRIGGERS):
-        # ── Path B: Overview/How/Why → flan-t5-large generation ───────────
+        # Path B — Overview / How / Why → flan-t5-base generation
         top_sentences = _score_sentences(question, results, top_n=5)
         prompt        = _build_prompt(question, top_sentences)
         answer        = _generate_with_flant5(prompt)
-        mode          = "generative · flan-t5-large"
+        mode          = "generative · flan-t5-base"
 
-        # Fallback if flan-t5 gives evasive or very short answer
         EVASIVE = ["i don't know", "i do not know", "unknown", "n/a", "none"]
         if len(answer.split()) < 8 or any(e in answer.lower() for e in EVASIVE):
             answer = _format_answer(question, top_sentences)
             mode   = "generative · composed fallback"
 
     else:
-        # ── Path C: General → composed sentence answer ─────────────────────
+        # Path C — General → composed sentence answer
         top_sentences = _score_sentences(question, results, top_n=4)
         answer        = _format_answer(question, top_sentences)
         mode          = "general · composed"
