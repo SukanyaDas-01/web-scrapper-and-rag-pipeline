@@ -115,43 +115,56 @@ def retrieve(query, top_k=5, min_score=0.10):
 
 def _build_prompt(question, context_chunks):
     """
-    flan-t5 works best with explicit instruction-style prompts.
-    Different prompt templates for overview vs specific questions.
+    Use only top 2 chunks — flan-t5-base has a hard 512 token limit.
+    Exceeding it causes the model to ignore context and hallucinate.
     """
-    context = " ".join([chunk["text"] for chunk in context_chunks])
+    # Sort by score, take only top 2
+    top_chunks = sorted(context_chunks, key=lambda x: -x["score"])[:2]
 
-    # Trim to 450 words — flan-t5-base has 512 token input limit
+    context = " ".join([chunk["text"] for chunk in top_chunks])
+
+    # Hard trim to 350 words to stay safely within 512 tokens
     context_words = context.split()
-    if len(context_words) > 450:
-        context = " ".join(context_words[:450]) + "..."
+    if len(context_words) > 350:
+        context = " ".join(context_words[:350])
 
     q_lower = question.lower().strip()
 
-    # Overview questions → ask for a summary-style answer
+    # Overview / summary questions
     if any(t in q_lower for t in ["about", "what is", "overview",
-                                   "describe", "tell me", "explain"]):
+                                   "describe", "tell me about",
+                                   "explain", "main topic"]):
         prompt = (
-            f"Read the following context and write a detailed summary "
-            f"of what it is about.\n\n"
-            f"Context: {context}\n\n"
+            f"Read the context carefully and write a clear summary.\n"
+            f"Context: {context}\n"
             f"Summary:"
         )
 
-    # How/Why questions → ask for explanation
-    elif any(t in q_lower for t in ["how", "why", "explain"]):
+    # How / Why questions
+    elif any(t in q_lower for t in ["how", "why"]):
         prompt = (
-            f"Read the context and answer the question in detail.\n\n"
-            f"Context: {context}\n\n"
-            f"Question: {question}\n\n"
-            f"Detailed answer:"
+            f"Read the context and answer the question.\n"
+            f"Context: {context}\n"
+            f"Question: {question}\n"
+            f"Answer:"
         )
 
-    # Default → direct QA
+    # Tell me about / describe specific topic
+    elif "tell" in q_lower or "describe" in q_lower:
+        prompt = (
+            f"Based only on the context below, describe the topic "
+            f"asked in the question.\n"
+            f"Context: {context}\n"
+            f"Question: {question}\n"
+            f"Answer:"
+        )
+
+    # Default direct QA
     else:
         prompt = (
-            f"Context: {context}\n\n"
-            f"Based on the context above, answer this question: "
-            f"{question}"
+            f"Context: {context}\n"
+            f"Question: {question}\n"
+            f"Answer:"
         )
 
     return prompt
@@ -160,10 +173,6 @@ def _build_prompt(question, context_chunks):
 # ── Generative Answer ─────────────────────────────────────────────────────────
 
 def _generate_answer(prompt, max_new_tokens=200):
-    """
-    flan-t5-base generation — temperature removed,
-    using beam search with repetition penalty instead.
-    """
     inputs = _tokenizer(
         prompt,
         return_tensors="pt",
@@ -171,14 +180,19 @@ def _generate_answer(prompt, max_new_tokens=200):
         max_length=512,
     )
 
+    # Check how many tokens the prompt actually consumed
+    input_len = inputs["input_ids"].shape[1]
+    # Leave enough room for the answer
+    allowed_new_tokens = min(max_new_tokens, max(50, 512 - input_len))
+
     outputs = _generator.generate(
         **inputs,
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=allowed_new_tokens,
         num_beams=4,
         early_stopping=True,
         no_repeat_ngram_size=3,
-        repetition_penalty=2.5,   # strongly discourages repetition
-        length_penalty=1.5,       # encourages longer, fuller answers
+        repetition_penalty=2.5,
+        length_penalty=1.5,
     )
 
     answer = _tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -192,32 +206,26 @@ def rag_query(question, top_k=5, show_sources=False):
     print(f"❓  {question}")
     print(f"{'='*60}")
 
-    # 1. Retrieve relevant chunks
+    # Retrieve top-k for display
     results = retrieve(question, top_k=top_k)
 
-    # 2. Fallback if nothing passes threshold
+    # Fallback if nothing passes threshold
     if not results:
         q_vec = _embedder.encode(
-            [question],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
+            [question], convert_to_numpy=True, normalize_embeddings=True,
         )
         scores, indices = _index.search(q_vec, min(3, len(_chunks)))
         results = [
-            {
-                "chunk_id": int(idx),
-                "score":    round(float(sc), 4),
-                "text":     _chunks[idx],
-            }
+            {"chunk_id": int(idx), "score": round(float(sc), 4),
+             "text": _chunks[idx]}
             for sc, idx in zip(scores[0], indices[0])
         ]
         print("ℹ️  Low confidence — using best available context.\n")
 
-    # 3. Build prompt from retrieved chunks
-    prompt = _build_prompt(question, results)
-
-    # 4. Generate answer with flan-t5
-    answer = _generate_answer(prompt)
+    # ── Pass only top 2 to prompt to stay within token limit ──
+    prompt_chunks = sorted(results, key=lambda x: -x["score"])[:2]
+    prompt  = _build_prompt(question, prompt_chunks)
+    answer  = _generate_answer(prompt)
 
     print(f"\n💡 Answer:\n   {textwrap.fill(answer, 80, subsequent_indent='   ')}")
 
@@ -225,8 +233,5 @@ def rag_query(question, top_k=5, show_sources=False):
         print(f"\n📄 Sources ({len(results)} chunks):")
         for r in results:
             print(f"\n  [chunk {r['chunk_id']}]  score={r['score']}")
-            print(textwrap.fill(
-                r["text"], 80,
-                initial_indent="  ",
-                subsequent_indent="  ",
-            ))
+            print(textwrap.fill(r["text"], 80,
+                                initial_indent="  ", subsequent_indent="  "))
