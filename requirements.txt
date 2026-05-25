@@ -1,9 +1,18 @@
+# Web scraping
 trafilatura
 beautifulsoup4
 requests
+
+# NLP
 spacy
+
+# Embeddings & vector search
 sentence-transformers
 faiss-cpu
 numpy
+
+# Transformers
 transformers
+
+# Deep learning
 torch
