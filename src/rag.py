@@ -203,6 +203,40 @@ def _compose_answer(top_sentences, min_sentences=3):
     return answer
 
 
+# ── Format answer from top sentences ─────────────────────────────────────────
+
+def _format_answer(question, top_sentences):
+    """
+    Builds a clean, readable answer directly from top scored sentences.
+    Filters out citation-style noise and formats into a paragraph.
+    """
+    NOISE_PATTERNS = [
+        r"^Archived from",
+        r"^Retrieved",
+        r"^\d{1,2} \w+ \d{4}",        # dates like "1 July 2021"
+        r"^https?://",                  # URLs
+        r'^\".+\"$',                    # pure quoted titles
+        r"^About \w+—",                 # "About Pune—District..."
+        r"\bArchived\b",
+        r"\bdoi:\b",
+        r"\bISBN\b",
+        r"\bpp\.\b",
+    ]
+
+    clean_sentences = []
+    for s in top_sentences:
+        if any(re.search(p, s, re.IGNORECASE) for p in NOISE_PATTERNS):
+            continue
+        if len(s.split()) < 6:
+            continue
+        clean_sentences.append(s)
+
+    if not clean_sentences:
+        return " ".join(top_sentences[:3])
+
+    return " ".join(clean_sentences)
+
+
 # ── Public query interface ────────────────────────────────────────────────────
 
 def rag_query(question, top_k=5, show_sources=False):
@@ -225,40 +259,19 @@ def rag_query(question, top_k=5, show_sources=False):
         ]
         print("ℹ️  Low confidence — using best available context.\n")
 
-    # 2. Score sentences across all retrieved chunks
+    # 2. Score and rank individual sentences
     top_sentences = _score_sentences(question, results, top_n=5)
 
-    # 3. Build tight prompt from top sentences
-    prompt = _build_prompt(question, top_sentences)
+    # 3. Build clean answer directly from top sentences
+    answer = _format_answer(question, top_sentences)
 
-    # 4. Generate with flan-t5
-    generated = _generate(prompt)
-
-    # 5. Quality check — if flan-t5 gives a very short or
-    #    evasive answer, fall back to composed sentence answer
-    fallback_phrases = ["i don't know", "i do not know", "unknown", "n/a"]
-    use_fallback = (
-        len(generated.split()) < 10
-        or any(p in generated.lower() for p in fallback_phrases)
-    )
-
-    if use_fallback:
-        answer = _compose_answer(top_sentences, min_sentences=3)
-        mode   = "composed"
-    else:
-        answer = generated
-        mode   = "generated"
-
-    print(f"\n💡 Answer ({mode}):\n   "
-          f"{textwrap.fill(answer, 80, subsequent_indent='   ')}")
+    print(f"\n💡 Answer:\n   "
+          f"{textwrap.fill(answer, 80, subsequent_indent='   ')}\n")
 
     if show_sources:
-        print(f"\n📄 Top sentences used:")
-        for i, s in enumerate(top_sentences, 1):
-            print(f"\n  [{i}] {textwrap.fill(s, 78, initial_indent='      ', subsequent_indent='      ')}")
-
-        print(f"\n📄 Retrieved chunks ({len(results)}):")
+        print(f"📄 Sources:")
         for r in results:
             print(f"\n  [chunk {r['chunk_id']}]  score={r['score']}")
-            print(textwrap.fill(r["text"], 80,
-                                initial_indent="  ", subsequent_indent="  "))
+            print(textwrap.fill(r["text"], 78,
+                                initial_indent="  ",
+                                subsequent_indent="  "))
