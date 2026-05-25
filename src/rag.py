@@ -237,7 +237,11 @@ def _format_answer(question, top_sentences):
     return " ".join(clean_sentences)
 
 
-# ── Public query interface ────────────────────────────────────────────────────
+# ── Confidence thresholds ─────────────────────────────────────────────────────
+HIGH_CONFIDENCE   = 0.50   # clearly relevant
+MEDIUM_CONFIDENCE = 0.30   # possibly relevant
+LOW_CONFIDENCE    = 0.30   # below this → out of scope
+
 
 def rag_query(question, top_k=5, show_sources=False):
     print(f"\n{'='*60}")
@@ -247,25 +251,35 @@ def rag_query(question, top_k=5, show_sources=False):
     # 1. Retrieve
     results = retrieve(question, top_k=top_k)
 
+    # 2. Check best score — gate the entire response on it
     if not results:
-        q_vec = _embedder.encode(
-            [question], convert_to_numpy=True, normalize_embeddings=True,
-        )
-        scores, indices = _index.search(q_vec, min(3, len(_chunks)))
-        results = [
-            {"chunk_id": int(idx), "score": round(float(sc), 4),
-             "text": _chunks[idx]}
-            for sc, idx in zip(scores[0], indices[0])
-        ]
-        print("ℹ️  Low confidence — using best available context.\n")
+        print("\n🤷 I don't have enough information to answer that question.\n")
+        return
 
-    # 2. Score and rank individual sentences
+    best_score = results[0]["score"]
+
+    # ── Hard out-of-scope gate ─────────────────────────────────────────────
+    if best_score < LOW_CONFIDENCE:
+        print(
+            f"\n🤷 This question doesn't seem to be related to the scraped page.\n"
+            f"   (Best match score: {best_score} — below threshold {LOW_CONFIDENCE})\n"
+            f"   Try asking something directly about the content of the page.\n"
+        )
+        return
+
+    # 3. Score sentences from retrieved chunks
     top_sentences = _score_sentences(question, results, top_n=5)
 
-    # 3. Build clean answer directly from top sentences
+    # 4. Build clean answer
     answer = _format_answer(question, top_sentences)
 
-    print(f"\n💡 Answer:\n   "
+    # ── Confidence label shown to user ────────────────────────────────────
+    if best_score >= HIGH_CONFIDENCE:
+        confidence = "🟢 High confidence"
+    else:
+        confidence = "🟡 Low confidence — answer may be partial"
+
+    print(f"\n💡 Answer ({confidence}):\n   "
           f"{textwrap.fill(answer, 80, subsequent_indent='   ')}\n")
 
     if show_sources:
