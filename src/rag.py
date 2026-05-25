@@ -4,14 +4,17 @@ import logging
 import textwrap
 import numpy as np
 import faiss
+import torch
 
-# ── Redirect ALL HuggingFace downloads to D: drive ───────────────────────────
-os.environ["HF_HOME"]              = r"D:\hf_cache"
-os.environ["TRANSFORMERS_CACHE"]   = r"D:\hf_cache\transformers"
-os.environ["HF_DATASETS_CACHE"]    = r"D:\hf_cache\datasets"
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+# ── Cache & warning configuration (must be before any HF imports) ─────────────
+os.environ["HF_HOME"]                      = r"D:\hf_cache"
+os.environ["TRANSFORMERS_CACHE"]           = r"D:\hf_cache\transformers"
+os.environ["HF_DATASETS_CACHE"]            = r"D:\hf_cache\datasets"
+os.environ["TRANSFORMERS_VERBOSITY"]       = "error"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
 from sentence_transformers import SentenceTransformer
 from transformers import (
@@ -20,13 +23,16 @@ from transformers import (
     pipeline,
 )
 
+# ── Use all CPU cores ─────────────────────────────────────────────────────────
+torch.set_num_threads(os.cpu_count() or 4)
+
 # ── Module-level singletons ───────────────────────────────────────────────────
 _embedder    = None
 _index       = None
 _chunks      = []
 _generator   = None
 _tokenizer   = None
-_qa_pipeline = None          # ← RoBERTa QA pipeline
+_qa_pipeline = None
 
 # ── Question type triggers ────────────────────────────────────────────────────
 FACTUAL_TRIGGERS  = ["who", "when", "where", "which", "how many", "how much"]
@@ -56,33 +62,43 @@ def setup_rag(
 ):
     """
     Initialises the full RAG pipeline:
-      - multi-qa-MiniLM-L6-cos-v1  → embeddings (QA-tuned, ~80MB)
-      - google/flan-t5-base         → overview / summary generation (~250MB)
+      - multi-qa-MiniLM-L6-cos-v1  → embeddings (~80MB)
+      - google/flan-t5-base         → generation (~250MB)
       - deepset/roberta-base-squad2 → factual extractive QA (~500MB)
       - FAISS IndexFlatIP           → cosine similarity search
     All models cached to D:\\hf_cache
     """
     global _embedder, _index, _chunks, _generator, _tokenizer, _qa_pipeline
 
+    CACHE = r"D:\hf_cache"
+
     # 1 ── Embedding model
     print("⏳ Loading embedding model (multi-qa-MiniLM-L6-cos-v1)...")
-    _embedder = SentenceTransformer(embed_model)
+    _embedder = SentenceTransformer(embed_model, cache_folder=CACHE)
     print("✅ Embedding model loaded")
 
     # 2 ── flan-t5-base for overview / summary answers
     print("⏳ Loading flan-t5-base (~250MB)...")
-    _tokenizer = T5Tokenizer.from_pretrained(gen_model)
-    _generator = T5ForConditionalGeneration.from_pretrained(gen_model)
+    _tokenizer = T5Tokenizer.from_pretrained(gen_model, cache_dir=CACHE)
+    _generator = T5ForConditionalGeneration.from_pretrained(
+        gen_model, cache_dir=CACHE
+    )
     print("✅ flan-t5-base loaded")
 
     # 3 ── RoBERTa for factual extractive QA
     print("⏳ Loading roberta-base-squad2 (~500MB)...")
-    _qa_pipeline = pipeline(
-        "question-answering",
-        model=qa_model,
-        tokenizer=qa_model,
-    )
-    print("✅ RoBERTa QA model loaded")
+    try:
+        _qa_pipeline = pipeline(
+            "question-answering",
+            model=qa_model,
+            tokenizer=qa_model,
+            model_kwargs={"cache_dir": CACHE},
+        )
+        print("✅ RoBERTa QA model loaded")
+    except Exception as e:
+        print(f"⚠️  RoBERTa failed to load: {e}")
+        print("   Factual questions will use sentence scorer fallback.")
+        _qa_pipeline = None
 
     # 4 ── Chunk the cleaned text
     _chunks, _ = _chunk_text(cleaned_text, chunk_size, overlap)
@@ -91,7 +107,7 @@ def setup_rag(
     print(f"⏳ Encoding {len(_chunks)} chunks...")
     embeddings = _embedder.encode(
         _chunks,
-        batch_size=32,
+        batch_size=64,
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=True,
@@ -245,10 +261,14 @@ def _format_answer(question, top_sentences):
 
 def _answer_with_roberta(question, context_chunks):
     """
-    Extractive QA using RoBERTa.
-    Tries every retrieved chunk and returns the highest-confidence span.
-    Best for: who / when / where / which / how many questions.
+    Extractive QA using RoBERTa (transformers==4.40.0).
+    Falls back to sentence scorer if pipeline is unavailable.
     """
+    # ── Fallback if RoBERTa failed to load ────────────────────────────────
+    if _qa_pipeline is None:
+        top_sentences = _score_sentences(question, context_chunks, top_n=2)
+        return _format_answer(question, top_sentences), 0.0
+
     best_score, best_answer = -1.0, ""
 
     for item in context_chunks:
@@ -263,6 +283,12 @@ def _answer_with_roberta(question, context_chunks):
                 best_answer = result["answer"]
         except Exception:
             continue
+
+    # ── Fallback if answer is too short or low confidence ─────────────────
+    if not best_answer or len(best_answer.split()) < 2 or best_score < 0.10:
+        top_sentences = _score_sentences(question, context_chunks, top_n=2)
+        best_answer   = _format_answer(question, top_sentences)
+        best_score    = 0.0
 
     return best_answer.strip(), round(best_score, 4)
 
@@ -303,7 +329,7 @@ def _build_prompt(question, top_sentences):
 def _generate_with_flant5(prompt):
     """
     Generates a natural language answer using flan-t5-base.
-    Dynamically caps max_new_tokens based on remaining token budget.
+    Optimised for CPU — uses num_beams=2 for speed.
     """
     inputs    = _tokenizer(
         prompt, return_tensors="pt",
@@ -315,11 +341,11 @@ def _generate_with_flant5(prompt):
     outputs = _generator.generate(
         **inputs,
         max_new_tokens=allowed_new_tokens,
-        num_beams=4,
+        num_beams=2,               # CPU optimised
         early_stopping=True,
         no_repeat_ngram_size=3,
         repetition_penalty=2.5,
-        length_penalty=2.0,
+        length_penalty=1.0,
     )
     return _tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
@@ -358,12 +384,7 @@ def rag_query(question, top_k=5, show_sources=False):
     if any(q_lower.startswith(t) or t in q_lower for t in FACTUAL_TRIGGERS):
         # Path A — Factual → RoBERTa extractive QA
         answer, qa_score = _answer_with_roberta(question, results)
-        mode = "factual · RoBERTa"
-
-        if not answer or len(answer.split()) < 3 or qa_score < 0.10:
-            top_sentences = _score_sentences(question, results, top_n=3)
-            answer        = _format_answer(question, top_sentences)
-            mode          = "factual · composed fallback"
+        mode = "factual · RoBERTa" if _qa_pipeline else "factual · composed"
 
     elif any(t in q_lower for t in OVERVIEW_TRIGGERS + HOW_WHY_TRIGGERS):
         # Path B — Overview / How / Why → flan-t5-base generation
